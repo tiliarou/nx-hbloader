@@ -9,9 +9,14 @@ const char* g_easterEgg = "Do you mean to tell me that you're thinking seriously
 static char g_argv[2048];
 static char g_nextArgv[2048];
 static char g_nextNroPath[512];
-static u64  g_nroAddr = 0;
+u64  g_nroAddr = 0;
 static u64  g_nroSize = 0;
 static NroHeader g_nroHeader;
+static bool g_isApplication = 0;
+
+static NsApplicationControlData g_applicationControlData;
+static bool g_isAutomaticGameplayRecording = 0;
+static bool g_smCloseWorkaround = false;
 
 static u8 g_savedTls[0x100];
 
@@ -73,6 +78,10 @@ void setupHbHeap(void)
     if (size==0)
         size = 0x2000000*16;
 
+    if (size > 0x6000000 && g_isAutomaticGameplayRecording) {
+        size -= 0x6000000;
+    }
+
     rc = svcSetHeapSize(&addr, size);
 
     if (R_FAILED(rc) || addr==NULL)
@@ -115,6 +124,49 @@ void threadFunc(void* ctx)
     svcCloseHandle(session);
 }
 
+//Gets the PID of the process with application_type==APPLICATION in the NPDM, then sets g_isApplication if it matches the current PID.
+void getIsApplication(void) {
+    Result rc=0;
+    u64 cur_pid=0, app_pid=0;
+
+    g_isApplication = 0;
+
+    rc = svcGetProcessId(&cur_pid, CUR_PROCESS_HANDLE);
+    if (R_FAILED(rc)) return;
+
+    rc = pmshellInitialize();
+
+    if (R_SUCCEEDED(rc)) {
+        rc = pmshellGetApplicationPid(&app_pid);
+        pmshellExit();
+    }
+
+    if (R_SUCCEEDED(rc) && cur_pid == app_pid) g_isApplication = 1;
+}
+
+//Gets the control.nacp for the current title id, and then sets g_isAutomaticGameplayRecording if less memory should be allocated.
+void getIsAutomaticGameplayRecording(void) {
+    if (kernelAbove500() && g_isApplication) {
+        Result rc=0;
+        u64 cur_tid=0;
+
+        rc = svcGetInfo(&cur_tid, 18, CUR_PROCESS_HANDLE, 0);
+        if (R_FAILED(rc)) return;
+
+        g_isAutomaticGameplayRecording = 0;
+
+        rc = nsInitialize();
+
+        if (R_SUCCEEDED(rc)) {
+            size_t dummy;
+            rc = nsGetApplicationControlData(0x1, cur_tid, &g_applicationControlData, sizeof(g_applicationControlData), &dummy);
+            nsExit();
+        }
+
+        if (R_SUCCEEDED(rc) && (((g_applicationControlData.nacp.x3034_unk >> 8) & 0xFF) == 2)) g_isAutomaticGameplayRecording = 1;
+    }
+}
+
 void getOwnProcessHandle(void)
 {
     static Thread t;
@@ -149,7 +201,7 @@ void getOwnProcessHandle(void)
     raw->x = raw->y = 0;
 
     rc = serviceIpcDispatch(&srv);
-    
+
     threadWaitForExit(&t);
     threadClose(&t);
 
@@ -169,8 +221,13 @@ void loadNro(void)
     size_t rw_size=0;
     Result rc=0;
 
-    svcSleepThread(1000000000);//Wait for sm-sysmodule to handle closing the sm session from this process. Without this delay smInitialize will fail once eventually used later.
-    //TODO: Lower the above delay-value?
+    if (g_smCloseWorkaround) {
+        // For old applications, wait for SM to handle closing the SM session from this process.
+        // If we don't do this, smInitialize will fail once eventually used later.
+        // This is caused by a bug in old versions of libnx that was fixed in commit 68a77ac950.
+        g_smCloseWorkaround = false;
+        svcSleepThread(1000000000);
+    }
 
     memcpy((u8*)armGetTls() + 0x100, g_savedTls, 0x100);
 
@@ -247,6 +304,10 @@ void loadNro(void)
     rw_size = header->segments[2].size + header->bss_size;
     rw_size = (rw_size+0xFFF) & ~0xFFF;
 
+    bool has_mod0 = false;
+    if (start->mod_offset > 0 && start->mod_offset <= (total_size-0x24)) // Validate MOD0 offset
+        has_mod0 = *(uint32_t*)(nrobuf + start->mod_offset) == 0x30444F4D; // Validate MOD0 header
+
     int i;
     for (i=0; i<3; i++)
     {
@@ -309,9 +370,17 @@ void loadNro(void)
         { EntryType_Argv,                 0, {0, 0} },
         { EntryType_NextLoadPath,         0, {0, 0} },
         { EntryType_LastLoadResult,       0, {0, 0} },
-        { EntryType_SyscallAvailableHint, 0, {0xffffffffffffffff, 0x1fc3fff0007ffff} },
+        { EntryType_SyscallAvailableHint, 0, {0xffffffffffffffff, 0x9fc1fff0007ffff} },
+        { EntryType_RandomSeed,           0, {0, 0} },
         { EntryType_EndOfList,            0, {0, 0} }
     };
+
+    ConfigEntry *entry_AppletType = &entries[2];
+
+    if (g_isApplication) {
+        entry_AppletType->Value[0] = AppletType_SystemApplication;
+        entry_AppletType->Value[1] = EnvAppletFlags_ApplicationOverride;
+    }
 
     // MainThreadHandle
     entries[0].Value[0] = envGetMainThreadHandle();
@@ -327,6 +396,9 @@ void loadNro(void)
     entries[5].Value[1] = (u64) &g_nextArgv[0];
     // LastLoadResult
     entries[6].Value[0] = g_lastRet;
+    // RandomSeed
+    entries[8].Value[0] = randomGet64();
+    entries[8].Value[1] = randomGet64();
 
     u64 entrypoint = map_addr;
 
@@ -334,6 +406,13 @@ void loadNro(void)
     g_nroSize = nro_size;
 
     memset(__stack_top - STACK_SIZE, 0, STACK_SIZE);
+
+    if (!has_mod0) {
+        // Apply sm-close workaround to NROs which do not contain a valid MOD0 header.
+        // This heuristic is based on the fact that MOD0 support was added very shortly after
+        // the fix for the sm-close bug (in fact, two commits later).
+        g_smCloseWorkaround = true;
+    }
 
     extern NORETURN void nroEntrypointTrampoline(u64 entries_ptr, u64 handle, u64 entrypoint);
     nroEntrypointTrampoline((u64) entries, -1, entrypoint);
@@ -343,6 +422,8 @@ int main(int argc, char **argv)
 {
     memcpy(g_savedTls, (u8*)armGetTls() + 0x100, 0x100);
 
+    getIsApplication();
+    getIsAutomaticGameplayRecording();
     setupHbHeap();
     getOwnProcessHandle();
     loadNro();
